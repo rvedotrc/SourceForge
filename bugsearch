@@ -1,0 +1,281 @@
+#!/usr/bin/perl -w
+# vi: set ts=4 sw=4 :
+
+use strict;
+
+my @xpath_conditions;
+my @perl_filters;
+
+my %namemap = (
+	id			=> "artifact_id",
+	submitter	=> "submitted_by",
+	assignee	=> "assigned_to",
+	type		=> "artifact_type",
+	group		=> "artifact_group_id",
+);
+
+my $generic_enum = sub {
+	my ($name, $arg) = @_;
+	$name = $namemap{$name} || $name;
+
+	if ($arg =~ /^(>|<|>=|<=)(\d+)/)
+	{
+		my $op = $1;
+		$arg = $2;
+		my $code = "sub { \$_->{$name} $op $arg }";
+		#print "Using code: $code\n";
+		my $sub = eval $code or die $@;
+		push @perl_filters, $sub;
+		return;
+	}
+
+	#if ($arg =~ /^!(.*)/)
+	{
+		push @xpath_conditions, "[ ./field [\@name='$name'][.='$arg'] ]";
+	}
+};
+
+my $generic_number = $generic_enum;
+
+my $generic_text = sub {
+	my ($name, $arg) = @_;
+	$name = $namemap{$name} || $name;
+	$arg = lc $arg;
+	my $AZ = join "", "A".."Z";
+	my $az = lc $AZ;
+	push @xpath_conditions, "[ ./field [\@name='$name'][contains(translate(.,'$AZ','$az'),'$arg')] ]";
+};
+
+my $output_format = "text";
+
+use Getopt::Long;
+GetOptions(
+	"xpath=s"		=> \@xpath_conditions,
+	"status=s"		=> $generic_enum,
+	"id=s"			=> $generic_number,
+	"priority=s"	=> $generic_number,
+	"type=s"		=> $generic_enum,
+	"resolution=s"	=> $generic_enum,
+	"category=s"	=> $generic_enum,
+	"group=s"		=> $generic_enum,
+	"summary=s"		=> $generic_text,
+	"details=s"		=> $generic_text,
+	"submitter=s"	=> $generic_enum,
+	"assignee=s"	=> $generic_enum,
+	"output-xml"	=> sub { $output_format = "xml" },
+	"output-text"	=> sub { $output_format = "text" },
+	"output-none"	=> sub { $output_format = "none" },
+) or exit 2;
+
+use XML::LibXML;
+my $parser = XML::LibXML->new;
+my $doc = $parser->parse_fh(\*STDIN);
+
+binmode STDOUT, ":encoding(iso-8859-1)";
+
+my $results_doc = $parser->parse_string(<<EOF);
+<?xml version='1.0' encoding='ISO-8859-1'?>
+<!DOCTYPE project_export SYSTEM "http://sourceforge.net/export/sf_project_export_0.1.dtd">
+<project_export>
+<artifacts/>
+</project_export>
+EOF
+(my $results) = $results_doc->findnodes("/project_export/artifacts");
+
+NODE:
+for my $artifact ($doc->findnodes("/project_export/artifacts/artifact @xpath_conditions"))
+{
+	my %f;
+
+	for my $field ($artifact->findnodes("./field"))
+	{
+		my $k = $field->getAttribute("name");
+		next if $k eq "artifact_messages";
+		next if $k eq "artifact_history";
+		$f{$k} = $field->textContent;
+	}
+
+	for my $cond (@perl_filters)
+	{
+		local $_ = \%f;
+		&$cond() or next NODE;
+	}
+
+	$results->appendChild($artifact);
+
+	(my $type = $f{artifact_type}) =~ s/s$//;
+
+	if ($output_format eq "text")
+	{
+		no warnings;
+		print <<EOF;
+================================================================================
+
+$type #$f{artifact_id}: $f{summary}
+http://sourceforge.net/support/tracker.php?aid=$f{artifact_id}
+
+Submitter:   $f{submitted_by} (http://sourceforge.net/users/$f{submitted_by}/)
+Open Date:   ${\ scalar gmtime $f{open_date} }
+Group:       $f{artifact_group_id}
+Category:    $f{category}
+Assigned To: $f{assigned_to}
+Status:      $f{status}
+Priority:    $f{priority}
+Resolution:  $f{resolution}
+
+$f{details}
+
+EOF
+
+		# artifact_messages/message/
+		my %messages_by_time;
+
+		for my $message ($artifact->findnodes("./field[\@name='artifact_messages']/message"))
+		{
+			my %m;
+
+			for my $field ($message->findnodes("./field"))
+			{
+				my $k = $field->getAttribute("name");
+				$m{$k} = $field->textContent;
+			}
+
+			$m{'body'} =~ s/\ALogged In: NO *\n\n//;
+			$m{'user_id'} = $1 if $m{'body'} =~ s/\ALogged In: YES *\nuser_id=(\d+)\n\n//;
+			$m{'body'} =~ s/\n*\z/\n/;
+
+			my $t = $m{'adddate'};
+			warn "Overwriting existing message with time=$t"
+				if $messages_by_time{$t};
+			$messages_by_time{$t} = \%m;
+		}
+
+		# artifact_history/history
+		my %history_by_time;
+
+		for my $history ($artifact->findnodes("./field[\@name='artifact_history']/history"))
+		{
+			my %h;
+
+			for my $field ($history->findnodes("./field"))
+			{
+				my $k = $field->getAttribute("name");
+				$h{$k} = $field->textContent;
+			}
+
+			# field_name, old_value, entrydate, mod_by (name)
+			push @{ $history_by_time{$h{'entrydate'}} }, \%h;
+		}
+
+		my %times;
+		@times{ keys(%messages_by_time), keys(%history_by_time) } = ();
+
+		for my $t (sort { $a<=>$b } keys %times)
+		{
+			my $m = $messages_by_time{$t} || {};
+			my $h = $history_by_time{$t} || [];
+
+			if ($m)
+			{
+				print "Message added ".localtime($t);
+				print " by $m->{'user_name'}";
+				print " (user #$m->{'user_id'})" if $m->{'user_id'};
+				print "\n";
+				printf "* %s changed from %s\n", $_->{'field_name'}, $_->{'old_value'}
+					for @$h;
+				print "\n", $m->{'body'}, "\n";
+			} else {
+				print "Changes made ".localtime($t);
+				print " by $h->[0]{'mod_by'}";
+				print "\n";
+				printf "* %s changed from %s\n", $_->{'field_name'}, $_->{'old_value'}
+					for @$h;
+			}
+		}
+	}
+}
+
+print $results_doc->toString if $output_format eq "xml";
+
+# Alas, cleanup has started producing segfaults, so let's bypass it.
+$| = 1; print "";
+require POSIX;
+POSIX::_exit(0);
+
+$doc = undef;
+$parser = undef;
+
+=pod
+
+<select name="new_artifact_type_id">
+	<option value="119506">Bugs</option>
+	<option value="369506">Feature Requests</option>
+	<option value="319506">Patches</option>
+	<option value="219506">Support Requests</option>
+</select>
+
+<select name="category_id">
+	<option value="100">None</option>
+	<option value="668971">iEatBrainz</option>
+	<option value="436499">MusicBrainz Client</option>
+	<option value="436498">MusicBrainz Server</option>
+	<option value="436501">MusicBrainz Tagger</option>
+	<option value="677288">Picard (MusicBrainz Tagger NG)</option>
+	<option value="436500">TunePimp Library</option>
+</select>
+
+<select name="artifact_group_id">
+<option value="100">None</option>
+</select>
+
+RFEs:
+<select name="artifact_group_id">
+	<option value="100">None</option>
+	<option value="401024">Data Display, Sort &amp; Filter</option>
+	<option value="401026">Data Entry UI</option>
+	<option value="401023">Moderation Search</option>
+	<option value="401025">New Data Fields / Structures</option>
+	<option value="401021">Reports</option>
+	<option value="401022">Web Service</option>
+</select>
+
+<select name="priority">
+	<option value="1">1 - Lowest</option>
+	<option value="2">2</option>
+	<option value="3">3</option>
+	<option value="4">4</option>
+	<option value="5">5 - Medium</option>
+	<option value="6">6</option>
+	<option value="7">7</option>
+	<option value="8">8</option>
+	<option value="9">9 - Highest</option></select>
+
+<select name="status_id">
+	<option value="1">Open</option>
+	<option value="2">Closed</option>
+	<option value="3">Deleted</option>
+	<option value="4">Pending</option>
+</select>
+
+<select name="resolution_id">
+	<option value="102">Accepted</option>
+	<option value="101">Duplicate</option>
+	<option value="1">Fixed</option>
+	<option value="2">Invalid</option>
+	<option value="4">Later</option>
+	<option value="100">None</option>
+	<option value="103">Out of Date</option>
+	<option value="104">Postponed</option>
+	<option value="105">Rejected</option>
+	<option value="5">Remind</option>
+	<option value="3">Wont Fix</option>
+	<option value="6">Works For Me</option>
+</select>
+
+</td>
+
+</td>
+
+=cut
+
+# eof bugsearch

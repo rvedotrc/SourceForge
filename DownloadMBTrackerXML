@@ -1,0 +1,262 @@
+#!/home/mbrainz/perl/bin/perl -w
+# vi: set ts=4 sw=4 :
+
+use warnings;
+use strict;
+
+my $filename = "export.xml";
+my $dir;
+my $verbose;
+my %debug;
+my $no_login;
+my $no_xml;
+my $no_attachments;
+my $no_logout;
+use Getopt::Long;
+GetOptions(
+	"output|o=s"	=> \$filename,
+	"directory|d=s"	=> \$dir,
+	"verbose|v"		=> \$verbose,
+	"debug=s"		=> sub { $debug{$_[1]} = 1 },
+	"no-login"		=> \$no_login,
+	"no-xml"		=> \$no_xml,
+	"no-attachments"=> \$no_attachments,
+	"no-logout"		=> \$no_logout,
+) or exit 2;
+
+die if @ARGV;
+defined($dir) or die $!;
+
+sub Log
+{
+	print localtime() . " : $_[0]\n" if $verbose;
+}
+
+use HTTP::Cookies;
+my $cookie_jar = HTTP::Cookies->new(
+	file => "$ENV{'HOME'}/.lwp_cookies.dat",
+	autosave => 1,
+	ignore_discard => 1,
+);
+
+use LWP;
+my $browser = LWP::UserAgent->new;
+$browser->cookie_jar($cookie_jar);
+
+use HTTP::Request::Common;
+my ($req, $res, $ok);
+
+Log("Logging in");
+$req = POST 'https://sourceforge.net/account/login.php',
+	[
+		return_to	=> '',
+		form_loginname => 'xxx',
+		form_pw	=> 'xxx',
+		# stay_in_ssl
+		# persistent_login
+		login => "Login With SSL",
+	];
+
+unless ($no_login)
+{
+	$res = $browser->request($req);
+	$res->code == 302
+		or die "Expected a 302 response, got this:\n" . $res->as_string;
+
+	$ok = 0;
+	$cookie_jar->scan(
+		sub {
+			$ok = 1 if $_[4] eq "sourceforge.net" and $_[1] =~ /session/i;
+		},
+	);
+
+	$ok or die;
+}
+
+my $group_id;
+
+if (open(my $fh, "<", "/home/rachel/MusicBrainz/bugs/group_id"))
+{
+	chomp($group_id = <$fh>);
+	close $fh;
+}
+
+if (not $group_id)
+{
+	# Find the project ID of musicbrainz
+	Log("Finding 'musicbrainz' project ID");
+	$req = GET "https://sourceforge.net/projects/musicbrainz/";
+	$res = $browser->request($req);
+	$res->code == 200 or die;
+
+	# Look for the link named "Admin"
+	use HTML::LinkExtor;
+	my $xtor = HTML::LinkExtor->new(
+		sub {
+			my ($tag, $attr, $url) = @_;
+			$tag eq "a" or return;
+			$attr eq "href" or return;
+			$url =~ m[/project/admin/\?group_id=(\d+)] or return;
+			$group_id = $1;
+		},
+		$res->base,
+	);
+
+	$xtor->parse($res->content);
+
+	$group_id or die "Couldn't work out musicbrainz group id";
+
+	open(my $gr, ">/home/rachel/MusicBrainz/bugs/group_id");
+	print $gr "$group_id\n";
+	close $gr;
+}
+
+# "Admin"
+# $req = GET "https://sourceforge.net/project/admin/?group_id=19506";
+
+# "Backups"
+# $req = GET "https://sourceforge.net/project/admin/backup.php?group_id=19506";
+
+unless ($no_xml)
+{
+	use File::Temp qw( tempfile );
+	use File::Basename qw( dirname basename );
+	my ($fh, $tempname) = tempfile(
+		basename($filename)."-XXXXXXXX",
+		DIR => dirname($filename),
+		CLEANUP => 1,
+	) or die $!;
+
+	# Now request the XML file
+	Log("Downloading XML file");
+	$req = GET "https://sourceforge.net/export/xml_export.php?group_id=$group_id";
+	$res = $browser->request(
+		$req,
+		sub { print $fh $_[0] or die $! },
+	);
+
+	$res->code == 200 or die;
+
+	close $fh or die $!;
+	rename $tempname, $filename or die $!;
+}
+
+unless ($no_attachments)
+{
+	Log("Mirroring attachments");
+	chdir $dir or die $!;
+	open(my $xmlfh, "<", $filename) or die $!;
+	MirrorAttachments($xmlfh);
+	close $xmlfh;
+}
+
+unless ($no_logout)
+{
+	Log("Logging out");
+	$req = GET "http://sourceforge.net/account/logout.php";
+	$res = $browser->request($req);
+	$res->code == 302 or $res->code == 200 or die;
+}
+
+exit;
+
+sub MirrorAttachments
+{
+	my $xmlfh = shift;
+
+	use XML::LibXML;
+	my $parser = XML::LibXML->new;
+	my $doc = $parser->parse_fh($xmlfh);
+
+	mkdir "attachments" or $!{EEXIST} or die $!;
+	chdir "attachments" or die $!;
+
+	my %types = reverse (
+		"119506"	=> "Bugs",
+		"369506"	=> "Feature Requests",
+		"319506"	=> "Patches",
+		"219506"	=> "Support Requests",
+	);
+
+	my %deleted;
+	for my $history ($doc->findnodes("
+		/project_export/artifacts/artifact
+		/field[\@name='artifact_history']
+		/history
+		[ ./field [\@name='field_name'] [ .='File Deleted' ] ]
+	")) {
+		my $id_and_name = $history->findvalue("./field [\@name='old_value']");
+		my ($id, $name) = $id_and_name =~ /^(\d+): (.*)$/;
+		$deleted{$id} = 1;
+	}
+
+	for my $history ($doc->findnodes("
+		/project_export/artifacts/artifact
+		/field[\@name='artifact_history']
+		/history
+		[ ./field [\@name='field_name'] [ .='File Added' ] ]
+	")) {
+		my $artifact = $history->parentNode->parentNode;
+		my $aid = $artifact->findvalue("./field [\@name='artifact_id']");
+		Log("aid=$aid") if $debug{"attachments"};
+
+		my $type = $artifact->findvalue("./field [\@name='artifact_type']");
+		my $atid = $types{$type};
+		Log("atid=$atid") if $debug{"attachments"};
+
+		my $id_and_name = $history->findvalue("./field [\@name='old_value']");
+		my ($id, $name) = $id_and_name =~ /^(\d+): (.*)$/;
+		my $mtime = $history->findvalue("./field [\@name='entrydate']");
+
+		Log("id=$id"), Log("name=$name") if $debug{"attachments"};
+		Log("time=".localtime($mtime)) if $debug{"attachments"};
+
+		my $url = "http://sourceforge.net/tracker/download.php?group_id=19506&atid=$atid&file_id=$id&aid=$aid";
+		Log("url=$url") if $debug{"attachments"};
+		my $file = "A$aid-F$id";
+		my $file2 = "$file-$name";
+
+		if (-f $file and not -f $file2)
+		{
+			rename $file, $file2;
+		}
+
+		unless (-f $file2)
+		{
+			if ($deleted{$id})
+			{
+				Log("Can't download $file2 - it has been deleted");
+			} else {
+
+				require LWP::UserAgent;
+				Log("Downloading $url");
+				my $resp = $browser->mirror($url, $file2);
+				Log($resp->status_line) if $debug{"attachments"};
+				utime $mtime, $mtime, $file2;
+
+				# Instead of failing with a sensible HTTP status (e.g. 403 Forbidden),
+				# SourceForge returns "200 OK" and we have to guess what to look for
+				# to tell if it failed or not.
+				if (open(my $fh, "<", $file2))
+				{
+					my $all = do { local $/; <$fh> };
+					if ($all =~ m{<TITLE>SourceForge.net: Exiting with Error</TITLE>})
+					{
+						warn "Failed to download $file2\n";
+						print STDERR $resp->headers->as_string, "\n";
+						use Data::Dumper;
+						print Data::Dumper->Dump([ $resp ],[ 'resp' ]);
+						system "cat $file2";
+						unlink $file2;
+					}
+				}
+			}
+		} else {
+			Log("$file2 exists") if $debug{"attachments"};
+		}
+
+		Log("") if $debug{"attachments"};
+	}
+}
+
+# eof 

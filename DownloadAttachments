@@ -1,0 +1,87 @@
+#!/usr/bin/perl -w
+# vi: set ts=4 sw=4 :
+
+use strict;
+
+use HTTP::Cookies;
+my $cookie_jar = HTTP::Cookies->new(
+	file => "$ENV{'HOME'}/.lwp_cookies.dat",
+	autosave => 1,
+);
+
+use LWP;
+my $browser = LWP::UserAgent->new;
+$browser->cookie_jar($cookie_jar);
+
+use XML::LibXML;
+my $parser = XML::LibXML->new;
+my $doc = $parser->parse_fh(\*STDIN);
+
+chdir "/home/rachel/MusicBrainz/bugs" or die $!;
+mkdir "attachments" or $!{EEXIST} or die $!;
+chdir "attachments" or die $!;
+
+my %types = reverse (
+	"119506"	=> "Bugs",
+	"369506"	=> "Feature Requests",
+	"319506"	=> "Patches",
+	"219506"	=> "Support Requests",
+);
+
+for my $history ($doc->findnodes("
+	/project_export/artifacts/artifact
+	/field[\@name='artifact_history']
+	/history
+	[ ./field [\@name='field_name'] [ .='File Added' ] ]
+")) {
+	my $artifact = $history->parentNode->parentNode;
+	my $aid = $artifact->findvalue("./field [\@name='artifact_id']");
+	print "aid=$aid\n";
+
+	my $type = $artifact->findvalue("./field [\@name='artifact_type']");
+	my $atid = $types{$type};
+	print "atid=$atid\n";
+
+	my $id_and_name = $history->findvalue("./field [\@name='old_value']");
+	my ($id, $name) = $id_and_name =~ /^(\d+): (.*)$/;
+	my $mtime = $history->findvalue("./field [\@name='entrydate']");
+
+	print "id=$id\nname=$name\n";
+	print "time=".localtime($mtime)."\n";
+
+	my $url = "http://sourceforge.net/tracker/download.php?group_id=19506&atid=$atid&file_id=$id&aid=$aid";
+	print "url=$url\n";
+	my $file = "A$aid-F$id";
+	my $file2 = "$file-$name";
+
+	if (-f $file and not -f $file2)
+	{
+		rename $file, $file2;
+	}
+
+	unless (-f $file2)
+	{
+		require LWP::UserAgent;
+		my $resp = $browser->mirror($url, $file2);
+		print $resp->status_line, "\n";
+		utime $mtime, $mtime, $file2;
+
+		# Instead of failing with a sensible HTTP status (e.g. 403 Forbidden),
+		# SourceForge returns "200 OK" and we have to guess what to look for
+		# to tell if it failed or not.
+		if (open(my $fh, "<", $file2))
+		{
+			my $all = do { local $/; <$fh> };
+			if ($all =~ m{<TITLE>SourceForge.net: Exiting with Error</TITLE>})
+			{
+				warn "Failed to download $file2\n";
+				print STDERR $resp->headers->as_string, "\n";
+				unlink $file2;
+			}
+		}
+	}
+
+	print "\n";
+}
+
+# eof DownloadAttachments

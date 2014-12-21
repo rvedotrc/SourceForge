@@ -1,0 +1,36 @@
+#!/home/mbrainz/perl/bin/perl -w
+# vi: set ts=4 sw=4 :
+
+use strict;
+use XML::LibXML;
+
+my $p = XML::LibXML->new;
+my $r = $p->parse_fh(\*STDIN);
+
+my @artifacts = $r->findnodes(<<'EOF');
+	//artifact
+		[string(./field[@name='category'	]) = 'None']
+		[string(./field[@name='status'		]) = 'Open']
+EOF
+#		[string(./field[@name='artifact_type'	]) = 'Bugs']
+
+my $project_mb = 19506;
+my $tracker_mb_bugs	= 119506;
+my $tracker_mb_support	= 219506;
+my $tracker_mb_patches	= 319506;
+my $tracker_mb_rfe	= 369506;
+
+for (@artifacts)
+{
+	my $id = ($_->findnodes("./field[\@name='artifact_id']"))[0]->firstChild->nodeValue;
+	my $su = ($_->findnodes("./field[\@name='summary']"))[0]->firstChild->nodeValue;
+	my $st = ($_->findnodes("./field[\@name='status']"))[0]->firstChild->nodeValue;
+
+	print "$id  $st  $su\n";
+	#printf "http://sourceforge.net/tracker/index.php?func=detail&aid=%d&group_id=$project_mb&atid=$tracker_mb_bugs\n",
+	printf "http://sourceforge.net/support/tracker.php?aid=%d\n",
+		$id;
+	print "\n";
+}
+
+# eof FindUncategorizedBugs
